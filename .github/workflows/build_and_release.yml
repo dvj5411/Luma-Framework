@@ -2,7 +2,7 @@ name: Build and Release Luma Mods
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, codex/big-walk-dlss-fsr3 ]
   pull_request:
     branches: [ main ]
 
