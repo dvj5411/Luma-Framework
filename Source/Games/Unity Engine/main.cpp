@@ -34,7 +34,7 @@ namespace
        { { "FarLoneSails.exe" }, MAKE_GAME_INFO("FAR: Lone Sails", "FLS", GAME_FAR_LONE_SAILS, { "Pumbo" }) },
        { { "FarChangingTides.exe" }, MAKE_GAME_INFO("FAR: Changing Tides", "FCT", GAME_FAR_CHANGING_TIDES, { "Pumbo" }) },
        { { "Hollow Knight Silksong.exe" }, MAKE_GAME_INFO("Hollow Knight: Silksong", "HKS", GAME_HOLLOW_KNIGHT_SILKSONG, { "Pumbo" }) },
-       { { "Big Walk.exe" }, MAKE_GAME_INFO("Big Walk", "BW", GAME_BIG_WALK, { "Codex", "Pumbo" }) },
+       { { "Big Walk.exe" }, MAKE_GAME_INFO("Big Walk", "BW", GAME_BIG_WALK, std::vector<std::string>({ "Codex", "Pumbo" })) },
    };
 
 #if ENABLE_SR
