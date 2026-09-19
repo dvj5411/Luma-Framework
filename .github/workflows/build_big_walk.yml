@@ -1,0 +1,23 @@
+name: Build Big Walk Luma
+
+on:
+  push:
+    branches: [ codex/big-walk-dlss-fsr3 ]
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: microsoft/setup-msbuild@v1.1.2
+      - name: Build Unity addon
+        shell: pwsh
+        run: |
+          msbuild "Source\Games\Unity Engine\Unity Engine.vcxproj" /p:Configuration=Publishing-Release /p:Platform=x64 /p:SolutionDir="$pwd\" /p:SolutionName=Luma /p:DefineConstants="REMOTE_BUILD=1"
+      - name: Upload addon
+        uses: actions/upload-artifact@v4
+        with:
+          name: Big-Walk-Luma-addon
+          path: Binaries/x64-Publishing-Release/Luma-Unity Engine.addon
