@@ -49,6 +49,8 @@
   </PropertyGroup>
   <PropertyGroup>
     <!-- Packaging defaults to off; enable via Project Properties -> Luma Properties -> Package after build. -->
+    <UseLumaNGX>true</UseLumaNGX>
+    <UseLumaFSR>true</UseLumaFSR>
     <LumaPackage>false</LumaPackage>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -591,5 +593,4 @@
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>
-
 

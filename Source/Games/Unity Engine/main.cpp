@@ -1,4 +1,5 @@
 #define GAME_UNITY_ENGINE 1
+#define ENABLE_POST_DRAW_DISPATCH_CALLBACK 1
 
 #include "..\..\Core\core.hpp"
 
@@ -16,6 +17,7 @@ namespace
    constexpr uint32_t GAME_FAR_LONE_SAILS = 7;
    constexpr uint32_t GAME_FAR_CHANGING_TIDES = 8;
    constexpr uint32_t GAME_HOLLOW_KNIGHT_SILKSONG = 9;
+   constexpr uint32_t GAME_BIG_WALK = 10;
    //TODOFT: add a way to add shader hashes name definitions hardcoded in code for debugging
    // TODO: PoP has a resource written by the CPU at the beginning
 
@@ -32,7 +34,74 @@ namespace
        { { "FarLoneSails.exe" }, MAKE_GAME_INFO("FAR: Lone Sails", "FLS", GAME_FAR_LONE_SAILS, { "Pumbo" }) },
        { { "FarChangingTides.exe" }, MAKE_GAME_INFO("FAR: Changing Tides", "FCT", GAME_FAR_CHANGING_TIDES, { "Pumbo" }) },
        { { "Hollow Knight Silksong.exe" }, MAKE_GAME_INFO("Hollow Knight: Silksong", "HKS", GAME_HOLLOW_KNIGHT_SILKSONG, { "Pumbo" }) },
+       { { "Big Walk.exe" }, MAKE_GAME_INFO("Big Walk", "BW", GAME_BIG_WALK, { "Codex", "Pumbo" }) },
    };
+
+#if ENABLE_SR
+   struct UnityTAAResourceBindings
+   {
+      int source = -1;
+      int history = -1;
+      int motion = -1;
+      int depth = -1;
+
+      bool Valid() const { return source >= 0 && history >= 0 && motion >= 0 && depth >= 0; }
+   };
+
+   std::mutex unity_taa_bindings_mutex;
+   std::unordered_map<uint64_t, UnityTAAResourceBindings> unity_taa_bindings;
+
+   // Unity keeps the URP shader names in DXBC reflection data. Detecting these
+   // bindings is substantially more resilient than shipping hashes for every
+   // Unity/URP patch and shader-keyword permutation.
+   void OnUnityPipeline(reshade::api::device* device, reshade::api::pipeline_layout,
+      uint32_t count, const reshade::api::pipeline_subobject* subobjects, reshade::api::pipeline)
+   {
+      if (device->get_api() != reshade::api::device_api::d3d11 || !Shader::d3d_reflect)
+         return;
+
+      for (uint32_t i = 0; i < count; ++i)
+      {
+         if (subobjects[i].type != reshade::api::pipeline_subobject_type::pixel_shader ||
+             subobjects[i].count != 1 || subobjects[i].data == nullptr)
+            continue;
+
+         const auto& shader = *static_cast<const reshade::api::shader_desc*>(subobjects[i].data);
+         if (shader.code == nullptr || shader.code_size == 0)
+            continue;
+
+         const uint64_t hash = Shader::BinToHash(static_cast<const uint8_t*>(shader.code), shader.code_size);
+         {
+            const std::lock_guard lock(unity_taa_bindings_mutex);
+            if (unity_taa_bindings.contains(hash))
+               continue;
+         }
+
+         UnityTAAResourceBindings bindings;
+         com_ptr<ID3D11ShaderReflection> reflection;
+         if (SUCCEEDED(Shader::d3d_reflect(shader.code, shader.code_size, IID_PPV_ARGS(&reflection))))
+         {
+            auto find_texture = [&](const char* name) -> int
+            {
+               D3D11_SHADER_INPUT_BIND_DESC desc = {};
+               return SUCCEEDED(reflection->GetResourceBindingDescByName(name, &desc)) &&
+                      desc.Type == D3D_SIT_TEXTURE ? static_cast<int>(desc.BindPoint) : -1;
+            };
+            bindings.source = find_texture("_BlitTexture");
+            bindings.history = find_texture("_TaaAccumulationTex");
+            bindings.motion = find_texture("_TaaMotionVectorTex");
+            bindings.depth = find_texture("_CameraDepthTexture");
+         }
+
+         const std::lock_guard lock(unity_taa_bindings_mutex);
+         unity_taa_bindings.emplace(hash, bindings);
+         if (bindings.Valid())
+            reshade::log::message(reshade::log::level::info,
+               std::format("Unity URP TAA detected: 0x{:08X}, color t{}, history t{}, motion t{}, depth t{}",
+                  hash, bindings.source, bindings.history, bindings.motion, bindings.depth).c_str());
+      }
+   }
+#endif
 
    const GameInfo& GetGameInfoFromID(uint32_t id)
    {
@@ -72,6 +141,16 @@ struct GameDeviceDataHollowKnightSilksong final : public GameDeviceData
    bool video_playing = false;
    com_ptr<ID3D11Resource> video_texture;
 };
+
+#if ENABLE_SR
+struct GameDeviceDataBigWalk final : public GameDeviceData
+{
+   com_ptr<ID3D11Texture2D> taa_output;
+   com_ptr<ID3D11Texture2D> motion_vectors;
+   com_ptr<ID3D11Texture2D> depth;
+   uint64_t taa_frame = 0;
+};
+#endif
 
 class UnityEngine final : public Game
 {
@@ -268,6 +347,16 @@ public:
       {
          device_data.game = new GameDeviceDataHollowKnightSilksong;
       }
+#if ENABLE_SR
+      else if (game_id == GAME_BIG_WALK)
+      {
+         device_data.game = new GameDeviceDataBigWalk;
+      }
+#endif
+      else
+      {
+         device_data.game = new GameDeviceData;
+      }
    }
 
    void OnInitSwapchain(reshade::api::swapchain* swapchain) override
@@ -289,6 +378,197 @@ public:
 
    DrawOrDispatchOverrideType OnDrawOrDispatch(ID3D11Device* native_device, ID3D11DeviceContext* native_device_context, CommandListData& cmd_list_data, DeviceData& device_data, reshade::api::shader_stage stages, const ShaderHashesList<OneShaderPerPipeline>& original_shader_hashes, bool is_custom_pass, bool& updated_cbuffers, std::function<void()>* original_draw_dispatch_func) override
    {
+#if ENABLE_SR
+      if (game_id == GAME_BIG_WALK && stages == reshade::api::shader_stage::pixel && !original_shader_hashes.pixel_shaders.empty())
+      {
+         auto& game_device_data = *static_cast<GameDeviceDataBigWalk*>(device_data.game);
+         const uint64_t shader_hash = original_shader_hashes.pixel_shaders[0];
+         UnityTAAResourceBindings taa_bindings;
+         {
+            const std::lock_guard lock(unity_taa_bindings_mutex);
+            const auto it = unity_taa_bindings.find(shader_hash);
+            if (it != unity_taa_bindings.end())
+               taa_bindings = it->second;
+         }
+
+         auto get_texture = [](ID3D11ShaderResourceView* view) -> com_ptr<ID3D11Texture2D>
+         {
+            com_ptr<ID3D11Texture2D> texture;
+            if (view != nullptr)
+            {
+               com_ptr<ID3D11Resource> resource;
+               view->GetResource(&resource);
+               if (resource != nullptr)
+                  resource->QueryInterface(&texture);
+            }
+            return texture;
+         };
+
+         // Remember the resources from URP's own temporal resolve. Big Walk's
+         // TAA is deliberately allowed to complete: its output is de-jittered,
+         // so the later DLSS/FSR dispatch can use a zero jitter without trying
+         // to guess Unity's Time.frameCount/Halton phase.
+         if (taa_bindings.Valid())
+         {
+            com_ptr<ID3D11ShaderResourceView> motion_srv;
+            com_ptr<ID3D11ShaderResourceView> depth_srv;
+            native_device_context->PSGetShaderResources(taa_bindings.motion, 1, &motion_srv);
+            native_device_context->PSGetShaderResources(taa_bindings.depth, 1, &depth_srv);
+
+            com_ptr<ID3D11RenderTargetView> output_rtv;
+            native_device_context->OMGetRenderTargets(1, &output_rtv, nullptr);
+            com_ptr<ID3D11Resource> output_resource;
+            if (output_rtv != nullptr)
+               output_rtv->GetResource(&output_resource);
+
+            com_ptr<ID3D11Texture2D> taa_output;
+            if (output_resource != nullptr)
+               output_resource->QueryInterface(&taa_output);
+
+            if (taa_output != nullptr && motion_srv != nullptr && depth_srv != nullptr)
+            {
+               game_device_data.taa_output = taa_output;
+               game_device_data.motion_vectors = get_texture(motion_srv.get());
+               game_device_data.depth = get_texture(depth_srv.get());
+               game_device_data.taa_frame++;
+               device_data.taa_detected = true;
+            }
+            return DrawOrDispatchOverrideType::None;
+         }
+
+         // URP performs a separate aspect-preserving upscale when renderScale
+         // is below 1. Replace that pass after the TAA resolve. Requiring live
+         // TAA resources from this frame and an output matching the swapchain
+         // avoids mistaking bloom/downsample work for the final upscale.
+         if (device_data.sr_type != SR::Type::None && !device_data.sr_suppressed &&
+             game_device_data.taa_output != nullptr && game_device_data.motion_vectors != nullptr &&
+             game_device_data.depth != nullptr && !device_data.has_drawn_sr)
+         {
+            com_ptr<ID3D11RenderTargetView> output_rtv;
+            native_device_context->OMGetRenderTargets(1, &output_rtv, nullptr);
+            com_ptr<ID3D11Resource> output_resource;
+            if (output_rtv != nullptr)
+               output_rtv->GetResource(&output_resource);
+            com_ptr<ID3D11Texture2D> output_texture;
+            if (output_resource != nullptr)
+               output_resource->QueryInterface(&output_texture);
+
+            if (output_texture != nullptr)
+            {
+               D3D11_TEXTURE2D_DESC output_desc = {};
+               output_texture->GetDesc(&output_desc);
+               const uint32_t expected_width = static_cast<uint32_t>(device_data.output_resolution.x);
+               const uint32_t expected_height = static_cast<uint32_t>(device_data.output_resolution.y);
+
+               com_ptr<ID3D11Texture2D> upscale_input;
+               D3D11_TEXTURE2D_DESC input_desc = {};
+               if (output_desc.Width == expected_width && output_desc.Height == expected_height)
+               {
+                  com_ptr<ID3D11ShaderResourceView> srvs[16];
+                  native_device_context->PSGetShaderResources(0, ARRAYSIZE(srvs), &srvs[0]);
+                  for (const auto& srv : srvs)
+                  {
+                     auto candidate = get_texture(srv.get());
+                     if (candidate == nullptr)
+                        continue;
+                     D3D11_TEXTURE2D_DESC desc = {};
+                     candidate->GetDesc(&desc);
+                     if (desc.Width >= 320 && desc.Height >= 180 &&
+                         desc.Width < output_desc.Width && desc.Height < output_desc.Height &&
+                         static_cast<uint64_t>(desc.Width) * output_desc.Height ==
+                            static_cast<uint64_t>(desc.Height) * output_desc.Width)
+                     {
+                        upscale_input = candidate;
+                        input_desc = desc;
+                        break;
+                     }
+                  }
+               }
+
+               if (upscale_input != nullptr)
+               {
+                  auto* sr_instance_data = device_data.GetSRInstanceData();
+                  auto implementation_it = sr_implementations.find(device_data.sr_type);
+                  if (sr_instance_data != nullptr && implementation_it != sr_implementations.end() && implementation_it->second != nullptr &&
+                      input_desc.Width >= sr_instance_data->min_resolution && input_desc.Height >= sr_instance_data->min_resolution)
+                  {
+                     SR::SettingsData settings;
+                     settings.output_width = output_desc.Width;
+                     settings.output_height = output_desc.Height;
+                     settings.render_width = input_desc.Width;
+                     settings.render_height = input_desc.Height;
+                     settings.dynamic_resolution = false;
+                     settings.hdr = true;
+                     settings.inverted_depth = true;
+                     settings.mvs_jittered = false;
+                     settings.auto_exposure = true;
+                     settings.render_preset = dlss_render_preset;
+                     // Unity stores forward motion in UV units. DLSS/FSR expect
+                     // current-to-previous motion, hence the negative pixel scale.
+                     settings.mvs_x_scale = -static_cast<float>(input_desc.Width);
+                     settings.mvs_y_scale = -static_cast<float>(input_desc.Height);
+                     implementation_it->second->UpdateSettings(sr_instance_data, native_device_context, settings);
+
+                     D3D11_TEXTURE2D_DESC sr_output_desc = output_desc;
+                     sr_output_desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+                     sr_output_desc.MiscFlags &= ~D3D11_RESOURCE_MISC_SHARED;
+                     bool recreate_output = device_data.sr_output_color == nullptr;
+                     if (!recreate_output)
+                     {
+                        D3D11_TEXTURE2D_DESC previous = {};
+                        device_data.sr_output_color->GetDesc(&previous);
+                        recreate_output = previous.Width != sr_output_desc.Width || previous.Height != sr_output_desc.Height ||
+                                          previous.Format != sr_output_desc.Format;
+                     }
+                     if (recreate_output)
+                     {
+                        device_data.sr_output_color = nullptr;
+                        if (FAILED(native_device->CreateTexture2D(&sr_output_desc, nullptr, &device_data.sr_output_color)))
+                           device_data.sr_output_color = nullptr;
+                        device_data.force_reset_sr = true;
+                     }
+
+                     if (device_data.sr_output_color != nullptr)
+                     {
+                        DrawStateStack<DrawStateStackType::FullGraphics> graphics_state;
+                        DrawStateStack<DrawStateStackType::Compute> compute_state;
+                        graphics_state.Cache(native_device_context, device_data.uav_max_count);
+                        compute_state.Cache(native_device_context, device_data.uav_max_count);
+
+                        SR::SuperResolutionImpl::DrawData draw;
+                        draw.source_color = upscale_input.get();
+                        draw.output_color = device_data.sr_output_color.get();
+                        draw.motion_vectors = game_device_data.motion_vectors.get();
+                        draw.depth_buffer = game_device_data.depth.get();
+                        draw.jitter_x = 0.0f;
+                        draw.jitter_y = 0.0f;
+                        draw.pre_exposure = 0.0f;
+                        draw.near_plane = 0.1f;
+                        draw.far_plane = 1000.0f;
+                        draw.vert_fov = 1.0471975512f;
+                        draw.render_width = input_desc.Width;
+                        draw.render_height = input_desc.Height;
+                        draw.reset = device_data.force_reset_sr;
+                        device_data.force_reset_sr = false;
+
+                        const bool succeeded = implementation_it->second->Draw(sr_instance_data, native_device_context, draw);
+                        graphics_state.Restore(native_device_context);
+                        compute_state.Restore(native_device_context);
+                        if (succeeded)
+                        {
+                           native_device_context->CopyResource(output_texture.get(), device_data.sr_output_color.get());
+                           device_data.has_drawn_sr = true;
+                           return DrawOrDispatchOverrideType::Replaced;
+                        }
+                        device_data.force_reset_sr = true;
+                     }
+                  }
+               }
+            }
+         }
+      }
+#endif
+
       // TODO: make a subclass for these games?
       if (game_id == GAME_HOLLOW_KNIGHT_SILKSONG)
       {
@@ -354,6 +634,15 @@ public:
 
    void OnPresent(ID3D11Device* native_device, DeviceData& device_data) override
    {
+#if ENABLE_SR
+      if (game_id == GAME_BIG_WALK)
+      {
+         auto& game_device_data = *static_cast<GameDeviceDataBigWalk*>(device_data.game);
+         game_device_data.taa_output = nullptr;
+         game_device_data.motion_vectors = nullptr;
+         game_device_data.depth = nullptr;
+      }
+#endif
       if (game_id == GAME_HOLLOW_KNIGHT_SILKSONG)
       {
          auto& game_device_data = *static_cast<GameDeviceDataHollowKnightSilksong*>(device_data.game);
@@ -380,6 +669,17 @@ public:
       reshade::api::effect_runtime* runtime = nullptr;
 
       ImGui::NewLine();
+
+#if ENABLE_SR
+      if (game_id == GAME_BIG_WALK)
+      {
+         ImGui::SeparatorText("Big Walk Super Resolution");
+         ImGui::TextWrapped("Set Big Walk to TAA and lower its render scale below 100%%. Luma replaces Unity URP's final DX11 upscale with the selected DLSS or FSR implementation.");
+         if (!device_data.taa_detected)
+            ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.2f, 1.0f), "Waiting for Unity URP TAA. Enable TAA in the game before selecting DLSS/FSR.");
+         ImGui::NewLine();
+      }
+#endif
 
       if (game_id == GAME_HOLLOW_KNIGHT_SILKSONG)
       {
@@ -605,7 +905,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
       game = new UnityEngine();
    }
 
-   CoreMain(hModule, ul_reason_for_call, lpReserved);
+#if ENABLE_SR
+   if (ul_reason_for_call == DLL_PROCESS_DETACH)
+      reshade::unregister_event<reshade::addon_event::init_pipeline>(OnUnityPipeline);
+#endif
 
-   return TRUE;
+   const BOOL result = CoreMain(hModule, ul_reason_for_call, lpReserved);
+
+#if ENABLE_SR
+   if (ul_reason_for_call == DLL_PROCESS_ATTACH && result)
+      reshade::register_event<reshade::addon_event::init_pipeline>(OnUnityPipeline);
+#endif
+
+   return result;
 }
